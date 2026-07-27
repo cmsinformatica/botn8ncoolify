@@ -1,0 +1,73 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.coolify
+    restart: unless-stopped
+    environment:
+      MPT_API_KEY: ${MPT_API_KEY:?configure MPT_API_KEY}
+      MPT_LLM_PROVIDER: ${MPT_LLM_PROVIDER:-openai}
+      MPT_OPENAI_API_KEY: ${MPT_OPENAI_API_KEY:-}
+      MPT_OPENAI_BASE_URL: ${MPT_OPENAI_BASE_URL:-}
+      MPT_OPENAI_MODEL: ${MPT_OPENAI_MODEL:-}
+      MPT_GEMINI_API_KEY: ${MPT_GEMINI_API_KEY:-}
+      MPT_PEXELS_API_KEY: ${MPT_PEXELS_API_KEY:-}
+      MPT_PIXABAY_API_KEY: ${MPT_PIXABAY_API_KEY:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+    expose:
+      - "8080"
+    volumes:
+      - mpt_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    ulimits:
+      nofile:
+        soft: 10240
+        hard: 10240
+
+  webui:
+    build:
+      context: .
+      dockerfile: Dockerfile.coolify
+    restart: unless-stopped
+    command:
+      - streamlit
+      - run
+      - ./webui/Main.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.enableCORS=true
+      - --browser.gatherUsageStats=false
+      - --client.toolbarMode=minimal
+      - --logger.hideWelcomeMessage=true
+      - --server.showEmailPrompt=false
+    environment:
+      MPT_API_KEY: ${MPT_API_KEY:?configure MPT_API_KEY}
+      MPT_LLM_PROVIDER: ${MPT_LLM_PROVIDER:-openai}
+      MPT_OPENAI_API_KEY: ${MPT_OPENAI_API_KEY:-}
+      MPT_OPENAI_BASE_URL: ${MPT_OPENAI_BASE_URL:-}
+      MPT_OPENAI_MODEL: ${MPT_OPENAI_MODEL:-}
+      MPT_GEMINI_API_KEY: ${MPT_GEMINI_API_KEY:-}
+      MPT_PEXELS_API_KEY: ${MPT_PEXELS_API_KEY:-}
+      MPT_PIXABAY_API_KEY: ${MPT_PIXABAY_API_KEY:-}
+    expose:
+      - "8501"
+    volumes:
+      - mpt_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    ulimits:
+      nofile:
+        soft: 10240
+        hard: 10240
+
+volumes:
+  mpt_data:

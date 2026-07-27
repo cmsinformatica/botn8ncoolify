@@ -1,0 +1,34 @@
+# MoneyPrinterTurbo no Coolify
+
+## Configuração do recurso
+
+1. Crie um recurso **Docker Compose** apontando para este repositório.
+2. Use `docker-compose.coolify.yml` como arquivo Compose.
+3. Crie dois domínios no Coolify:
+   - domínio da API apontando para o serviço `api`, porta `8080`;
+   - domínio da interface apontando para o serviço `webui`, porta `8501`.
+4. Configure as variáveis de `.env.coolify.example`.
+5. Mantenha o volume nomeado `mpt_data`; ele guarda configuração, materiais temporários e vídeos.
+
+## Variáveis mínimas
+
+- `MPT_API_KEY`: chave privada usada pelo n8n para chamar a API.
+- `MPT_LLM_PROVIDER`: use `openai` para provedores compatíveis.
+- `MPT_OPENAI_API_KEY`, `MPT_OPENAI_BASE_URL` e `MPT_OPENAI_MODEL`.
+- Uma fonte de materiais: `MPT_PEXELS_API_KEY` ou `MPT_PIXABAY_API_KEY`.
+
+O Edge TTS é o padrão e não precisa de chave.
+
+## Verificação
+
+- API: `https://SEU-DOMINIO-API/docs`
+- WebUI: `https://SEU-DOMINIO-WEBUI`
+- Saúde da API: o Coolify consulta `/docs`.
+- Saúde da WebUI: o Coolify consulta `/_stcore/health`.
+
+## Segurança
+
+- Não exponha `MPT_API_KEY` no navegador ou no Telegram.
+- Restrinja a API no firewall ou no proxy para o servidor do n8n quando possível.
+- Desative publicação automática durante os primeiros testes.
+- Não use a tag de imagem `latest`; esta implantação constrói o commit fixado no repositório.
