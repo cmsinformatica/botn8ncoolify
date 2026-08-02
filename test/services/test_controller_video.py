@@ -215,6 +215,8 @@ class TestVideoControllerTasks(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 video_controller.create_video(None, request, body)
+            with self.assertRaises(RuntimeError):
+                video_controller.create_video(None, request, body)
 
     def test_commit_failure_after_enqueue_preserves_single_pending_identity(self):
         manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
@@ -235,8 +237,6 @@ class TestVideoControllerTasks(unittest.TestCase):
         self.assertEqual(record["state"], "pending")
         self.assertTrue(record["task_id"])
         self._cleanup_queued_tasks(manager)
-            with self.assertRaises(RuntimeError):
-                video_controller.create_video(None, request, body)
 
     def test_create_video_same_key_rejects_divergent_payload(self):
         """Reusar uma chave para conteúdo diferente deve retornar conflito 409."""
