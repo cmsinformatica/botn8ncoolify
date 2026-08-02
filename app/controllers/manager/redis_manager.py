@@ -3,7 +3,7 @@ from typing import Dict
 
 import redis
 
-from app.controllers.manager.base_manager import TaskManager
+from app.controllers.manager.base_manager import IdempotencyConflictError, TaskManager
 from app.models.schema import VideoParams
 from app.services import task as tm
 
@@ -25,6 +25,42 @@ class RedisTaskManager(TaskManager):
 
     def create_queue(self):
         return "task_queue"
+
+    def claim_idempotency(
+        self, idempotency_key: str, payload_hash: str, task_id: str
+    ) -> tuple[str, bool]:
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        record = self.idempotency_record(payload_hash, task_id)
+        if self.redis_client.set(storage_key, record, nx=True):
+            return task_id, True
+
+        existing_raw = self.redis_client.get(storage_key)
+        if existing_raw is None:
+            # A previous owner may have rolled back between SET NX and GET.
+            if self.redis_client.set(storage_key, record, nx=True):
+                return task_id, True
+            existing_raw = self.redis_client.get(storage_key)
+        if isinstance(existing_raw, bytes):
+            existing_raw = existing_raw.decode("utf-8")
+        existing = json.loads(existing_raw)
+        if existing["payload_hash"] != payload_hash:
+            raise IdempotencyConflictError(
+                "idempotency key already used with a different payload"
+            )
+        return existing["task_id"], False
+
+    def release_idempotency(
+        self, idempotency_key: str, payload_hash: str, task_id: str
+    ) -> None:
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        expected = self.idempotency_record(payload_hash, task_id)
+        self.redis_client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            storage_key,
+            expected,
+        )
 
     def enqueue(self, task: Dict):
         task_with_serializable_params = task.copy()

@@ -2,7 +2,9 @@ import asyncio
 import os
 import shutil
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,10 +12,11 @@ from unittest.mock import MagicMock, patch
 
 from app.config import config
 from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.v1 import video as video_controller
 from app.models import const
 from app.models.exception import HttpException
-from app.models.schema import TaskListResponse, TaskQueryResponse
+from app.models.schema import TaskListResponse, TaskQueryResponse, TaskVideoRequest
 from app.services import state as sm
 from app.utils import utils
 
@@ -122,8 +125,80 @@ class TestVideoControllerHelpers(unittest.TestCase):
 
 class TestVideoControllerTasks(unittest.TestCase):
     @staticmethod
-    def _request():
-        return SimpleNamespace(headers={"x-task-id": "request-123"})
+    def _request(headers=None):
+        request_headers = {"x-task-id": "request-123"}
+        request_headers.update(headers or {})
+        return SimpleNamespace(headers=request_headers)
+
+    @staticmethod
+    def _cleanup_queued_tasks(manager):
+        while not manager.is_queue_empty():
+            queued = manager.dequeue()
+            task_id = queued["kwargs"]["task_id"]
+            sm.state.delete_task(task_id)
+
+    def test_create_video_concurrent_same_key_schedules_once(self):
+        """Contendores reais com a mesma chave/payload devem compartilhar task_id e fila."""
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=20)
+        body = TaskVideoRequest(video_subject="Atomic coffee")
+        request = self._request(
+            {
+                "idempotency-key": "video-create-atomic-1",
+                "x-request-id": "request-fallback-must-not-win",
+            }
+        )
+        barrier = threading.Barrier(8)
+
+        def submit():
+            barrier.wait()
+            return video_controller.create_video(None, request, body)
+
+        try:
+            with patch.object(video_controller, "task_manager", manager):
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    responses = list(executor.map(lambda _: submit(), range(8)))
+
+            task_ids = {response["data"]["task_id"] for response in responses}
+            self.assertEqual(len(task_ids), 1)
+            self.assertEqual(manager.queue_size(), 1)
+        finally:
+            self._cleanup_queued_tasks(manager)
+
+    def test_create_video_same_key_rejects_divergent_payload(self):
+        """Reusar uma chave para conteúdo diferente deve retornar conflito 409."""
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
+        request = self._request({"idempotency-key": "video-create-conflict-1"})
+
+        try:
+            with patch.object(video_controller, "task_manager", manager):
+                video_controller.create_video(
+                    None, request, TaskVideoRequest(video_subject="Coffee")
+                )
+                with self.assertRaises(HttpException) as raised:
+                    video_controller.create_video(
+                        None, request, TaskVideoRequest(video_subject="Tea")
+                    )
+
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertEqual(manager.queue_size(), 1)
+        finally:
+            self._cleanup_queued_tasks(manager)
+
+    def test_create_video_falls_back_to_x_request_id(self):
+        """Sem Idempotency-Key, X-Request-ID deve fornecer a mesma semântica."""
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
+        request = self._request({"x-request-id": "video-fallback-1"})
+        body = TaskVideoRequest(video_subject="Fallback coffee")
+
+        try:
+            with patch.object(video_controller, "task_manager", manager):
+                first = video_controller.create_video(None, request, body)
+                second = video_controller.create_video(None, request, body)
+
+            self.assertEqual(first["data"]["task_id"], second["data"]["task_id"])
+            self.assertEqual(manager.queue_size(), 1)
+        finally:
+            self._cleanup_queued_tasks(manager)
 
     def test_create_task_queues_requested_pipeline_stage(self):
         """创建任务应持久化初始状态，并把原请求模型与停止阶段交给队列。"""

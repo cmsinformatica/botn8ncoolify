@@ -1,3 +1,5 @@
+import hashlib
+import json
 import threading
 from typing import Any, Callable, Dict
 
@@ -8,13 +10,58 @@ class TaskQueueFullError(ValueError):
     pass
 
 
+class IdempotencyConflictError(ValueError):
+    pass
+
+
 class TaskManager:
     def __init__(self, max_concurrent_tasks: int, max_queued_tasks: int = 100):
         self.max_concurrent_tasks = max_concurrent_tasks
         self.max_queued_tasks = max_queued_tasks
         self.current_tasks = 0
         self.lock = threading.Lock()
+        self._idempotency_records = {}
         self.queue = self.create_queue()
+
+    @staticmethod
+    def idempotency_storage_key(idempotency_key: str) -> str:
+        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        return f"moneyprinter:idempotency:videos:{digest}"
+
+    @staticmethod
+    def idempotency_record(payload_hash: str, task_id: str) -> str:
+        return json.dumps(
+            {"payload_hash": payload_hash, "task_id": task_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def claim_idempotency(
+        self, idempotency_key: str, payload_hash: str, task_id: str
+    ) -> tuple[str, bool]:
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        with self.lock:
+            existing = self._idempotency_records.get(storage_key)
+            if existing is None:
+                self._idempotency_records[storage_key] = {
+                    "payload_hash": payload_hash,
+                    "task_id": task_id,
+                }
+                return task_id, True
+            if existing["payload_hash"] != payload_hash:
+                raise IdempotencyConflictError(
+                    "idempotency key already used with a different payload"
+                )
+            return existing["task_id"], False
+
+    def release_idempotency(
+        self, idempotency_key: str, payload_hash: str, task_id: str
+    ) -> None:
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        with self.lock:
+            existing = self._idempotency_records.get(storage_key)
+            if existing == {"payload_hash": payload_hash, "task_id": task_id}:
+                self._idempotency_records.pop(storage_key, None)
 
     def create_queue(self):
         raise NotImplementedError()

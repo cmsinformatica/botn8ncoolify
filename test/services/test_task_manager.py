@@ -2,7 +2,10 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    IdempotencyConflictError,
+    TaskQueueFullError,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.models.schema import VideoParams
@@ -189,6 +192,55 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertIsNone(self.manager.dequeue())
         self.assertTrue(self.manager.is_queue_empty())
         self.assertEqual(self.manager.queue_size(), 2)
+
+    def test_claim_idempotency_uses_atomic_set_nx_and_reuses_task(self):
+        """Redis compartilhado deve eleger um owner e devolver seu task_id aos demais."""
+        existing_record = self.manager.idempotency_record("payload-a", "task-owner")
+        self.redis_client.set.side_effect = [True, False]
+        self.redis_client.get.return_value = existing_record.encode("utf-8")
+
+        owner = self.manager.claim_idempotency(
+            "private-request-key", "payload-a", "task-owner"
+        )
+        contender = self.manager.claim_idempotency(
+            "private-request-key", "payload-a", "task-loser"
+        )
+
+        self.assertEqual(owner, ("task-owner", True))
+        self.assertEqual(contender, ("task-owner", False))
+        storage_key = self.redis_client.set.call_args_list[0].args[0]
+        self.assertNotIn("private-request-key", storage_key)
+        self.assertEqual(
+            self.redis_client.set.call_args_list[0].kwargs,
+            {"nx": True},
+        )
+
+    def test_claim_idempotency_rejects_payload_mismatch(self):
+        """Registro Redis existente com outro fingerprint não pode ser reutilizado."""
+        self.redis_client.set.return_value = False
+        self.redis_client.get.return_value = self.manager.idempotency_record(
+            "payload-original", "task-owner"
+        )
+
+        with self.assertRaises(IdempotencyConflictError):
+            self.manager.claim_idempotency(
+                "private-request-key", "payload-divergent", "task-loser"
+            )
+
+    def test_release_idempotency_is_compare_and_delete(self):
+        """Rollback Redis só deve excluir exatamente o registro ainda pertencente ao owner."""
+        self.manager.release_idempotency(
+            "private-request-key", "payload-a", "task-owner"
+        )
+
+        script, key_count, storage_key, expected = self.redis_client.eval.call_args.args
+        self.assertIn("redis.call('get'", script)
+        self.assertEqual(key_count, 1)
+        self.assertNotIn("private-request-key", storage_key)
+        self.assertEqual(
+            expected,
+            self.manager.idempotency_record("payload-a", "task-owner"),
+        )
 
 
 if __name__ == "__main__":

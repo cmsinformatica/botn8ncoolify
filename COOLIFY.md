@@ -32,3 +32,18 @@ O Edge TTS é o padrão e não precisa de chave.
 - Restrinja a API no firewall ou no proxy para o servidor do n8n quando possível.
 - Desative publicação automática durante os primeiros testes.
 - Não use a tag de imagem `latest`; esta implantação constrói o commit fixado no repositório.
+
+## Idempotência da criação de vídeos
+
+`POST /api/v1/videos` aceita `Idempotency-Key` e, quando esse header não é
+enviado, usa `X-Request-ID` como fallback. Repetir a mesma chave com o mesmo
+payload devolve o mesmo `task_id` sem agendar uma segunda geração. Reutilizar a
+chave com payload diferente retorna HTTP 409. As chaves recebidas não são
+gravadas diretamente: somente um hash SHA-256 é usado como chave interna.
+
+Com `enable_redis = false`, a exclusão atômica usa o lock do
+`InMemoryTaskManager` e vale apenas dentro do mesmo processo Python. Isso cobre
+o serviço API padrão deste Compose enquanto ele executar um único processo, mas
+não oferece garantia entre réplicas ou múltiplos workers. Para esse cenário,
+habilite Redis e faça todas as instâncias compartilharem o mesmo database; o
+claim então usa `SET NX` atômico. Redis deve permanecer privado à aplicação.

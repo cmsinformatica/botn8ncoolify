@@ -1,4 +1,6 @@
 import glob
+import hashlib
+import json
 import os
 import pathlib
 import shutil
@@ -11,7 +13,10 @@ from loguru import logger
 
 from app.config import config
 from app.controllers import base
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    IdempotencyConflictError,
+    TaskQueueFullError,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1.base import new_router
@@ -174,7 +179,15 @@ def _parse_byte_range(
 def create_video(
     background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
 ):
-    return create_task(request, body, stop_at="video")
+    idempotency_key = request.headers.get("idempotency-key") or request.headers.get(
+        "x-request-id"
+    )
+    return create_task(
+        request,
+        body,
+        stop_at="video",
+        idempotency_key=idempotency_key.strip() if idempotency_key else None,
+    )
 
 
 @router.post("/subtitle", response_model=TaskResponse, summary="Generate subtitle only")
@@ -195,9 +208,39 @@ def create_task(
     request: Request,
     body: Union[TaskVideoRequest, SubtitleRequest, AudioRequest],
     stop_at: str,
+    idempotency_key: str | None = None,
 ):
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
+    payload_hash = None
+    owns_idempotency = False
+    if idempotency_key:
+        canonical_payload = json.dumps(
+            {"body": body.model_dump(mode="json"), "stop_at": stop_at},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+        try:
+            task_id, owns_idempotency = task_manager.claim_idempotency(
+                idempotency_key, payload_hash, task_id
+            )
+        except IdempotencyConflictError as e:
+            raise HttpException(
+                task_id=request_id,
+                status_code=409,
+                message=f"{request_id}: {str(e)}",
+            )
+
+        if not owns_idempotency:
+            task = {
+                "task_id": task_id,
+                "request_id": request_id,
+                "params": body.model_dump(),
+            }
+            return utils.get_response(200, task)
+
     try:
         task = {
             "task_id": task_id,
@@ -210,6 +253,10 @@ def create_task(
         return utils.get_response(200, task)
     except TaskQueueFullError as e:
         sm.state.delete_task(task_id)
+        if owns_idempotency:
+            task_manager.release_idempotency(
+                idempotency_key, payload_hash, task_id
+            )
         logger.warning(
             f"reject task because queue is full, request_id: {request_id}, task_id: {task_id}"
         )
@@ -217,6 +264,10 @@ def create_task(
             task_id=task_id, status_code=429, message=f"{request_id}: {str(e)}"
         )
     except ValueError as e:
+        if owns_idempotency:
+            task_manager.release_idempotency(
+                idempotency_key, payload_hash, task_id
+            )
         raise HttpException(
             task_id=task_id, status_code=400, message=f"{request_id}: {str(e)}"
         )
