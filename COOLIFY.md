@@ -47,3 +47,12 @@ o serviço API padrão deste Compose enquanto ele executar um único processo, m
 não oferece garantia entre réplicas ou múltiplos workers. Para esse cenário,
 habilite Redis e faça todas as instâncias compartilharem o mesmo database; o
 claim então usa `SET NX` atômico. Redis deve permanecer privado à aplicação.
+
+Uma reserva recém-criada fica em `pending` até a tarefa entrar na fila; só então
+é promovida por compare-and-set para `committed`. Se a promoção for ambígua
+depois do enqueue, a API responde 503 e preserva tanto a tarefa quanto a
+reserva: repita exclusivamente com a mesma `Idempotency-Key`. Não remova a
+chave nem envie uma nova identidade. Para recuperação manual, consulte a chave
+SHA-256 `moneyprinter:idempotency:videos:<hash>` e o `task_id` associado antes
+de qualquer intervenção; um registro `pending` pode corresponder a uma tarefa
+já aceita cuja confirmação Redis falhou.

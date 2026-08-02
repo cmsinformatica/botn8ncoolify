@@ -13,6 +13,34 @@ from app.models.schema import VideoParams
 from app.services import task as task_service
 
 
+class ThreadSafeFakeRedis:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._values = {}
+
+    def set(self, key, value, nx=False):
+        with self._lock:
+            if nx and key in self._values:
+                return False
+            self._values[key] = value
+            return True
+
+    def get(self, key):
+        with self._lock:
+            value = self._values.get(key)
+            return value.encode("utf-8") if isinstance(value, str) else value
+
+    def eval(self, _script, _key_count, key, expected, replacement=None):
+        with self._lock:
+            if self._values.get(key) != expected:
+                return 0
+            if replacement is None:
+                del self._values[key]
+            else:
+                self._values[key] = replacement
+            return 1
+
+
 class TestInMemoryTaskManager(unittest.TestCase):
     def test_pending_commit_lifecycle_and_bounded_wait(self):
         manager = InMemoryTaskManager(0, 2)
@@ -265,6 +293,28 @@ class TestRedisTaskManager(unittest.TestCase):
                 "payload-a", "task-owner", "pending", "owner-token"
             ),
         )
+
+    def test_thread_safe_fake_redis_commits_one_owner_and_fences_release(self):
+        fake = ThreadSafeFakeRedis()
+        manager = RedisTaskManager.__new__(RedisTaskManager)
+        manager.redis_client = fake
+        results = []
+
+        def reserve():
+            results.append(manager.reserve_idempotency("same-key", "hash", "task"))
+
+        threads = [threading.Thread(target=reserve) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        owners = [result for result in results if result[2]]
+        self.assertEqual(len(owners), 1)
+        task_id, token, _ = owners[0]
+        manager.commit_idempotency("same-key", "hash", task_id, token)
+        self.assertEqual(manager.wait_idempotency("same-key", "hash", 0), task_id)
+        manager.release_idempotency("same-key", "hash", task_id, token)
+        self.assertEqual(manager.wait_idempotency("same-key", "hash", 0), task_id)
 
 
 if __name__ == "__main__":

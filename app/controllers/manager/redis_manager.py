@@ -34,12 +34,17 @@ class RedisTaskManager(TaskManager):
         storage_key = self.idempotency_storage_key(idempotency_key)
         owner_token = uuid.uuid4().hex
         record = self.idempotency_record(payload_hash, task_id, "pending", owner_token)
-        if self.redis_client.set(storage_key, record, nx=True):
-            return task_id, owner_token, True
+        deadline = time.monotonic() + 0.25
+        while True:
+            if self.redis_client.set(storage_key, record, nx=True):
+                return task_id, owner_token, True
 
-        existing_raw = self.redis_client.get(storage_key)
-        if existing_raw is None:
-            return self.reserve_idempotency(idempotency_key, payload_hash, task_id)
+            existing_raw = self.redis_client.get(storage_key)
+            if existing_raw is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("idempotency reservation is unavailable")
+            time.sleep(0.01)
         if isinstance(existing_raw, bytes):
             existing_raw = existing_raw.decode("utf-8")
         existing = json.loads(existing_raw)

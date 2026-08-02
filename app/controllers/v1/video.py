@@ -4,7 +4,6 @@ import json
 import os
 import pathlib
 import shutil
-import time
 from typing import Union
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
@@ -219,6 +218,7 @@ def create_task(
     payload_hash = None
     owns_idempotency = False
     owner_token = None
+    task_enqueued = False
     if idempotency_key:
         canonical_payload = json.dumps(
             {"body": body.model_dump(mode="json"), "stop_at": stop_at},
@@ -257,8 +257,19 @@ def create_task(
         }
         sm.state.update_task(task_id)
         task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at=stop_at)
+        task_enqueued = True
         if owns_idempotency:
-            task_manager.commit_idempotency(idempotency_key, payload_hash, task_id, owner_token)
+            try:
+                task_manager.commit_idempotency(idempotency_key, payload_hash, task_id, owner_token)
+            except Exception as exc:
+                logger.error(
+                    f"idempotency commit uncertain after enqueue, request_id: {request_id}, task_id: {task_id}, error: {exc}"
+                )
+                raise HttpException(
+                    task_id=task_id,
+                    status_code=503,
+                    message=f"{request_id}: task accepted; retry with the same idempotency key",
+                )
         logger.success(f"Task created: {utils.to_json(task)}")
         return utils.get_response(200, task)
     except TaskQueueFullError as e:
@@ -281,10 +292,13 @@ def create_task(
         raise HttpException(
             task_id=task_id, status_code=400, message=f"{request_id}: {str(e)}"
         )
+    except HttpException:
+        raise
     except Exception:
-        sm.state.delete_task(task_id)
-        if owns_idempotency:
-            task_manager.release_idempotency(idempotency_key, payload_hash, task_id, owner_token)
+        if not task_enqueued:
+            sm.state.delete_task(task_id)
+            if owns_idempotency:
+                task_manager.release_idempotency(idempotency_key, payload_hash, task_id, owner_token)
         raise
 
 @router.get("/tasks", response_model=TaskListResponse, summary="Get all tasks")

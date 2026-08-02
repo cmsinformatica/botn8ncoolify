@@ -3,7 +3,6 @@ import os
 import shutil
 import tempfile
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -216,6 +215,26 @@ class TestVideoControllerTasks(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 video_controller.create_video(None, request, body)
+
+    def test_commit_failure_after_enqueue_preserves_single_pending_identity(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
+        request = self._request({"idempotency-key": "commit-ambiguous"})
+        body = TaskVideoRequest(video_subject="Commit ambiguity")
+        with patch.object(video_controller, "task_manager", manager), patch.object(
+            manager, "commit_idempotency", side_effect=RuntimeError("redis timeout")
+        ), patch.object(video_controller, "IDEMPOTENCY_WAIT_SECONDS", 0):
+            with self.assertRaises(HttpException) as owner:
+                video_controller.create_video(None, request, body)
+            with self.assertRaises(HttpException) as duplicate:
+                video_controller.create_video(None, request, body)
+
+        self.assertEqual(owner.exception.status_code, 503)
+        self.assertEqual(duplicate.exception.status_code, 503)
+        self.assertEqual(manager.queue_size(), 1)
+        record = next(iter(manager._idempotency_records.values()))
+        self.assertEqual(record["state"], "pending")
+        self.assertTrue(record["task_id"])
+        self._cleanup_queued_tasks(manager)
             with self.assertRaises(RuntimeError):
                 video_controller.create_video(None, request, body)
 
