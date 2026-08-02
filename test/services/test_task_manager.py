@@ -1,5 +1,6 @@
 import json
 import unittest
+import threading
 from unittest.mock import MagicMock, patch
 
 from app.controllers.manager.base_manager import (
@@ -13,6 +14,23 @@ from app.services import task as task_service
 
 
 class TestInMemoryTaskManager(unittest.TestCase):
+    def test_pending_commit_lifecycle_and_bounded_wait(self):
+        manager = InMemoryTaskManager(0, 2)
+        task_id, owner_token, owner = manager.reserve_idempotency("key", "hash", "task")
+        self.assertTrue(owner)
+        self.assertIsNone(manager.wait_idempotency("key", "hash", timeout=0.01))
+        manager.commit_idempotency("key", "hash", task_id, owner_token)
+        self.assertEqual(manager.wait_idempotency("key", "hash", timeout=0), task_id)
+
+    def test_release_is_owner_fenced(self):
+        manager = InMemoryTaskManager(0, 2)
+        task_id, owner_token, _ = manager.reserve_idempotency("key", "hash", "task")
+        manager.release_idempotency("key", "hash", task_id, "wrong-owner")
+        self.assertIsNone(manager.wait_idempotency("key", "hash", timeout=0))
+        manager.release_idempotency("key", "hash", task_id, owner_token)
+        new_id, _, owner = manager.reserve_idempotency("key", "hash", "new-task")
+        self.assertTrue(owner)
+        self.assertEqual(new_id, "new-task")
     def test_queue_operations_preserve_task_payload(self):
         """内存队列应保持函数、位置参数和关键字参数，不得改变任务内容。"""
         manager = InMemoryTaskManager(max_concurrent_tasks=1, max_queued_tasks=2)
@@ -193,21 +211,25 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertTrue(self.manager.is_queue_empty())
         self.assertEqual(self.manager.queue_size(), 2)
 
-    def test_claim_idempotency_uses_atomic_set_nx_and_reuses_task(self):
+    def test_reserve_idempotency_uses_atomic_set_nx_and_reuses_task(self):
         """Redis compartilhado deve eleger um owner e devolver seu task_id aos demais."""
-        existing_record = self.manager.idempotency_record("payload-a", "task-owner")
+        existing_record = self.manager.idempotency_record(
+            "payload-a", "task-owner", "pending", "owner-token"
+        )
         self.redis_client.set.side_effect = [True, False]
         self.redis_client.get.return_value = existing_record.encode("utf-8")
 
-        owner = self.manager.claim_idempotency(
+        owner = self.manager.reserve_idempotency(
             "private-request-key", "payload-a", "task-owner"
         )
-        contender = self.manager.claim_idempotency(
+        contender = self.manager.reserve_idempotency(
             "private-request-key", "payload-a", "task-loser"
         )
 
-        self.assertEqual(owner, ("task-owner", True))
-        self.assertEqual(contender, ("task-owner", False))
+        self.assertEqual(owner[0], "task-owner")
+        self.assertIsNotNone(owner[1])
+        self.assertTrue(owner[2])
+        self.assertEqual(contender, ("task-owner", None, False))
         storage_key = self.redis_client.set.call_args_list[0].args[0]
         self.assertNotIn("private-request-key", storage_key)
         self.assertEqual(
@@ -215,7 +237,7 @@ class TestRedisTaskManager(unittest.TestCase):
             {"nx": True},
         )
 
-    def test_claim_idempotency_rejects_payload_mismatch(self):
+    def test_reserve_idempotency_rejects_payload_mismatch(self):
         """Registro Redis existente com outro fingerprint não pode ser reutilizado."""
         self.redis_client.set.return_value = False
         self.redis_client.get.return_value = self.manager.idempotency_record(
@@ -223,14 +245,14 @@ class TestRedisTaskManager(unittest.TestCase):
         )
 
         with self.assertRaises(IdempotencyConflictError):
-            self.manager.claim_idempotency(
+            self.manager.reserve_idempotency(
                 "private-request-key", "payload-divergent", "task-loser"
             )
 
     def test_release_idempotency_is_compare_and_delete(self):
         """Rollback Redis só deve excluir exatamente o registro ainda pertencente ao owner."""
         self.manager.release_idempotency(
-            "private-request-key", "payload-a", "task-owner"
+            "private-request-key", "payload-a", "task-owner", "owner-token"
         )
 
         script, key_count, storage_key, expected = self.redis_client.eval.call_args.args
@@ -239,7 +261,9 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertNotIn("private-request-key", storage_key)
         self.assertEqual(
             expected,
-            self.manager.idempotency_record("payload-a", "task-owner"),
+            self.manager.idempotency_record(
+                "payload-a", "task-owner", "pending", "owner-token"
+            ),
         )
 
 

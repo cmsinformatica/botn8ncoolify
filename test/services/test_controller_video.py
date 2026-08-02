@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -163,6 +164,60 @@ class TestVideoControllerTasks(unittest.TestCase):
             self.assertEqual(manager.queue_size(), 1)
         finally:
             self._cleanup_queued_tasks(manager)
+
+    def test_duplicate_never_observes_task_before_owner_enqueues(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
+        body = TaskVideoRequest(video_subject="Paused owner")
+        request = self._request({"idempotency-key": "paused-owner"})
+        entered = threading.Event()
+        release = threading.Event()
+        original_add = manager.add_task
+
+        def paused_add(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return original_add(*args, **kwargs)
+
+        with patch.object(video_controller, "task_manager", manager), patch.object(
+            manager, "add_task", side_effect=paused_add
+        ), patch.object(video_controller, "IDEMPOTENCY_WAIT_SECONDS", 0.05):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                owner = executor.submit(video_controller.create_video, None, request, body)
+                self.assertTrue(entered.wait(1))
+                duplicate = executor.submit(video_controller.create_video, None, request, body)
+                with self.assertRaises(HttpException) as raised:
+                    duplicate.result(timeout=1)
+                self.assertEqual(raised.exception.status_code, 503)
+                release.set()
+                owner_response = owner.result(timeout=1)
+
+        self.assertEqual(manager.queue_size(), 1)
+        self.assertIsNotNone(owner_response["data"]["task_id"])
+        self._cleanup_queued_tasks(manager)
+
+    def test_failed_enqueue_releases_pending_claim_for_retry(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=0)
+        request = self._request({"idempotency-key": "queue-full-retry"})
+        body = TaskVideoRequest(video_subject="Retry")
+        with patch.object(video_controller, "task_manager", manager):
+            with self.assertRaises(HttpException) as first:
+                video_controller.create_video(None, request, body)
+            with self.assertRaises(HttpException) as second:
+                video_controller.create_video(None, request, body)
+        self.assertEqual(first.exception.status_code, 429)
+        self.assertEqual(second.exception.status_code, 429)
+
+    def test_unexpected_enqueue_failure_releases_pending_claim(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=0, max_queued_tasks=5)
+        request = self._request({"idempotency-key": "runtime-retry"})
+        body = TaskVideoRequest(video_subject="Retry runtime")
+        with patch.object(video_controller, "task_manager", manager), patch.object(
+            manager, "add_task", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                video_controller.create_video(None, request, body)
+            with self.assertRaises(RuntimeError):
+                video_controller.create_video(None, request, body)
 
     def test_create_video_same_key_rejects_divergent_payload(self):
         """Reusar uma chave para conteúdo diferente deve retornar conflito 409."""

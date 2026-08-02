@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import shutil
+import time
 from typing import Union
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
@@ -175,6 +176,9 @@ def _parse_byte_range(
     return start, end
 
 
+IDEMPOTENCY_WAIT_SECONDS = 2.0
+
+
 @router.post("/videos", response_model=TaskResponse, summary="Generate a short video")
 def create_video(
     background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
@@ -214,6 +218,7 @@ def create_task(
     request_id = base.get_task_id(request)
     payload_hash = None
     owns_idempotency = False
+    owner_token = None
     if idempotency_key:
         canonical_payload = json.dumps(
             {"body": body.model_dump(mode="json"), "stop_at": stop_at},
@@ -223,7 +228,7 @@ def create_task(
         )
         payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
         try:
-            task_id, owns_idempotency = task_manager.claim_idempotency(
+            task_id, owner_token, owns_idempotency = task_manager.reserve_idempotency(
                 idempotency_key, payload_hash, task_id
             )
         except IdempotencyConflictError as e:
@@ -234,6 +239,9 @@ def create_task(
             )
 
         if not owns_idempotency:
+            task_id = task_manager.wait_idempotency(idempotency_key, payload_hash, IDEMPOTENCY_WAIT_SECONDS)
+            if task_id is None:
+                raise HttpException(task_id=request_id, status_code=503, message=f"{request_id}: idempotent request is still pending")
             task = {
                 "task_id": task_id,
                 "request_id": request_id,
@@ -249,13 +257,15 @@ def create_task(
         }
         sm.state.update_task(task_id)
         task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at=stop_at)
+        if owns_idempotency:
+            task_manager.commit_idempotency(idempotency_key, payload_hash, task_id, owner_token)
         logger.success(f"Task created: {utils.to_json(task)}")
         return utils.get_response(200, task)
     except TaskQueueFullError as e:
         sm.state.delete_task(task_id)
         if owns_idempotency:
             task_manager.release_idempotency(
-                idempotency_key, payload_hash, task_id
+                idempotency_key, payload_hash, task_id, owner_token
             )
         logger.warning(
             f"reject task because queue is full, request_id: {request_id}, task_id: {task_id}"
@@ -266,11 +276,16 @@ def create_task(
     except ValueError as e:
         if owns_idempotency:
             task_manager.release_idempotency(
-                idempotency_key, payload_hash, task_id
+                idempotency_key, payload_hash, task_id, owner_token
             )
         raise HttpException(
             task_id=task_id, status_code=400, message=f"{request_id}: {str(e)}"
         )
+    except Exception:
+        sm.state.delete_task(task_id)
+        if owns_idempotency:
+            task_manager.release_idempotency(idempotency_key, payload_hash, task_id, owner_token)
+        raise
 
 @router.get("/tasks", response_model=TaskListResponse, summary="Get all tasks")
 def get_all_tasks(

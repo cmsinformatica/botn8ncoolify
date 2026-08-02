@@ -1,6 +1,8 @@
 import hashlib
 import json
 import threading
+import time
+import uuid
 from typing import Any, Callable, Dict
 
 from loguru import logger
@@ -20,6 +22,7 @@ class TaskManager:
         self.max_queued_tasks = max_queued_tasks
         self.current_tasks = 0
         self.lock = threading.Lock()
+        self._idempotency_changed = threading.Condition(self.lock)
         self._idempotency_records = {}
         self.queue = self.create_queue()
 
@@ -29,39 +32,69 @@ class TaskManager:
         return f"moneyprinter:idempotency:videos:{digest}"
 
     @staticmethod
-    def idempotency_record(payload_hash: str, task_id: str) -> str:
+    def idempotency_record(payload_hash: str, task_id: str, state="committed", owner_token=None) -> str:
         return json.dumps(
-            {"payload_hash": payload_hash, "task_id": task_id},
+            {"owner_token": owner_token, "payload_hash": payload_hash, "state": state, "task_id": task_id},
             sort_keys=True,
             separators=(",", ":"),
         )
 
-    def claim_idempotency(
+    def reserve_idempotency(
         self, idempotency_key: str, payload_hash: str, task_id: str
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, str | None, bool]:
         storage_key = self.idempotency_storage_key(idempotency_key)
         with self.lock:
             existing = self._idempotency_records.get(storage_key)
             if existing is None:
+                owner_token = uuid.uuid4().hex
                 self._idempotency_records[storage_key] = {
                     "payload_hash": payload_hash,
                     "task_id": task_id,
+                    "state": "pending",
+                    "owner_token": owner_token,
                 }
-                return task_id, True
+                return task_id, owner_token, True
             if existing["payload_hash"] != payload_hash:
                 raise IdempotencyConflictError(
                     "idempotency key already used with a different payload"
                 )
-            return existing["task_id"], False
+            return existing["task_id"], None, False
+
+    def wait_idempotency(self, idempotency_key, payload_hash, timeout):
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        deadline = time.monotonic() + max(0, timeout)
+        with self._idempotency_changed:
+            while True:
+                existing = self._idempotency_records.get(storage_key)
+                if existing is None:
+                    return None
+                if existing["payload_hash"] != payload_hash:
+                    raise IdempotencyConflictError("idempotency key already used with a different payload")
+                if existing["state"] == "committed":
+                    return existing["task_id"]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._idempotency_changed.wait(remaining)
+
+    def commit_idempotency(self, idempotency_key, payload_hash, task_id, owner_token):
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        expected = {"payload_hash": payload_hash, "task_id": task_id, "state": "pending", "owner_token": owner_token}
+        with self._idempotency_changed:
+            if self._idempotency_records.get(storage_key) != expected:
+                raise RuntimeError("idempotency reservation ownership lost")
+            self._idempotency_records[storage_key] = {**expected, "state": "committed", "owner_token": None}
+            self._idempotency_changed.notify_all()
 
     def release_idempotency(
-        self, idempotency_key: str, payload_hash: str, task_id: str
+        self, idempotency_key: str, payload_hash: str, task_id: str, owner_token: str
     ) -> None:
         storage_key = self.idempotency_storage_key(idempotency_key)
         with self.lock:
             existing = self._idempotency_records.get(storage_key)
-            if existing == {"payload_hash": payload_hash, "task_id": task_id}:
+            if existing == {"payload_hash": payload_hash, "task_id": task_id, "state": "pending", "owner_token": owner_token}:
                 self._idempotency_records.pop(storage_key, None)
+                self._idempotency_changed.notify_all()
 
     def create_queue(self):
         raise NotImplementedError()

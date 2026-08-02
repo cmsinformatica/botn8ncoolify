@@ -1,4 +1,6 @@
 import json
+import time
+import uuid
 from typing import Dict
 
 import redis
@@ -26,20 +28,18 @@ class RedisTaskManager(TaskManager):
     def create_queue(self):
         return "task_queue"
 
-    def claim_idempotency(
+    def reserve_idempotency(
         self, idempotency_key: str, payload_hash: str, task_id: str
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, str | None, bool]:
         storage_key = self.idempotency_storage_key(idempotency_key)
-        record = self.idempotency_record(payload_hash, task_id)
+        owner_token = uuid.uuid4().hex
+        record = self.idempotency_record(payload_hash, task_id, "pending", owner_token)
         if self.redis_client.set(storage_key, record, nx=True):
-            return task_id, True
+            return task_id, owner_token, True
 
         existing_raw = self.redis_client.get(storage_key)
         if existing_raw is None:
-            # A previous owner may have rolled back between SET NX and GET.
-            if self.redis_client.set(storage_key, record, nx=True):
-                return task_id, True
-            existing_raw = self.redis_client.get(storage_key)
+            return self.reserve_idempotency(idempotency_key, payload_hash, task_id)
         if isinstance(existing_raw, bytes):
             existing_raw = existing_raw.decode("utf-8")
         existing = json.loads(existing_raw)
@@ -47,13 +47,43 @@ class RedisTaskManager(TaskManager):
             raise IdempotencyConflictError(
                 "idempotency key already used with a different payload"
             )
-        return existing["task_id"], False
+        return existing["task_id"], None, False
+
+    def wait_idempotency(self, idempotency_key, payload_hash, timeout):
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        deadline = time.monotonic() + max(0, timeout)
+        while True:
+            raw = self.redis_client.get(storage_key)
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            record = json.loads(raw)
+            if record["payload_hash"] != payload_hash:
+                raise IdempotencyConflictError("idempotency key already used with a different payload")
+            if record["state"] == "committed":
+                return record["task_id"]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.02, remaining))
+
+    def commit_idempotency(self, idempotency_key, payload_hash, task_id, owner_token):
+        storage_key = self.idempotency_storage_key(idempotency_key)
+        expected = self.idempotency_record(payload_hash, task_id, "pending", owner_token)
+        committed = self.idempotency_record(payload_hash, task_id, "committed", None)
+        changed = self.redis_client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('set', KEYS[1], ARGV[2]) else return 0 end",
+            1, storage_key, expected, committed,
+        )
+        if not changed:
+            raise RuntimeError("idempotency reservation ownership lost")
 
     def release_idempotency(
-        self, idempotency_key: str, payload_hash: str, task_id: str
+        self, idempotency_key: str, payload_hash: str, task_id: str, owner_token: str
     ) -> None:
         storage_key = self.idempotency_storage_key(idempotency_key)
-        expected = self.idempotency_record(payload_hash, task_id)
+        expected = self.idempotency_record(payload_hash, task_id, "pending", owner_token)
         self.redis_client.eval(
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
             "return redis.call('del', KEYS[1]) else return 0 end",
